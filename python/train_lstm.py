@@ -35,20 +35,20 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-import torchvision.models as models
 from tqdm import tqdm
 
-# ---------------------------------------------------------------------------
-# Architecture constants — must match classifier.py and production inference
-# ---------------------------------------------------------------------------
-EMBEDDING_DIM = 256
-LSTM_HIDDEN_DIM = 128
-TEMPORAL_WINDOW = 16   # Frames per sequence
-TEMPORAL_STRIDE = 8    # Sliding-window stride (50% overlap)
-
-# ImageNet normalisation (must match detector.py preprocessing)
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+# Shared model architecture (single source of truth)
+from models import (
+    EfficientNetEmbedder,
+    TemporalLSTM,
+    load_efficientnet_embedder,
+    EMBEDDING_DIM,
+    LSTM_HIDDEN_DIM,
+    TEMPORAL_WINDOW,
+    TEMPORAL_STRIDE,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -61,89 +61,7 @@ logging.basicConfig(
 logger = logging.getLogger("train_lstm")
 
 
-# ===================================================================
-# Model definitions
-# ===================================================================
-
-class EfficientNetEmbedder(nn.Module):
-    """EfficientNet-B0 backbone that produces 256-dim embeddings.
-
-    This mirrors the architecture used in training (see gradcam.py):
-        torchvision efficientnet_b0
-        classifier = Linear(1280, 256) -> ReLU -> Linear(256, 1)
-
-    For embedding extraction we keep everything up to and including the
-    first linear + ReLU layer (the 256-dim bottleneck), discarding the
-    final classification head.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        base = models.efficientnet_b0(weights=None)
-        # features (Conv layers) + avgpool produce a 1280-dim vector
-        self.features = base.features
-        self.avgpool = base.avgpool
-        # Embedding projection: 1280 -> 256
-        self.embed_fc = nn.Linear(1280, EMBEDDING_DIM)
-        self.embed_relu = nn.ReLU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Return 256-dim embedding for each input image.
-
-        Args:
-            x: (B, 3, 224, 224) normalised face crops.
-
-        Returns:
-            (B, 256) embedding tensor.
-        """
-        x = self.features(x)
-        x = self.avgpool(x)
-        x = torch.flatten(x, 1)  # (B, 1280)
-        x = self.embed_relu(self.embed_fc(x))  # (B, 256)
-        return x
-
-
-class TemporalLSTM(nn.Module):
-    """Single-layer LSTM for temporal deepfake detection.
-
-    Takes a sequence of frame embeddings and outputs a single scalar
-    score via sigmoid, indicating the probability of the sequence
-    being *real*.
-
-    Architecture:
-        LSTM(input_size=256, hidden_size=128, num_layers=1, batch_first=True)
-        -> take last hidden state -> Linear(128, 1)
-    """
-
-    def __init__(
-        self,
-        input_size: int = EMBEDDING_DIM,
-        hidden_size: int = LSTM_HIDDEN_DIM,
-        num_layers: int = 1,
-    ) -> None:
-        super().__init__()
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-        )
-        self.fc = nn.Linear(hidden_size, 1)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Produce a per-sequence score.
-
-        Args:
-            x: (B, seq_len, input_size) embedding sequences.
-
-        Returns:
-            (B,) raw logits (apply sigmoid externally for probabilities).
-        """
-        # lstm_out: (B, seq_len, hidden_size), (h_n, c_n)
-        _, (h_n, _) = self.lstm(x)
-        # h_n shape: (num_layers, B, hidden_size) — take last layer
-        out = self.fc(h_n[-1])  # (B, 1)
-        return out.squeeze(-1)  # (B,)
+# EfficientNetEmbedder, TemporalLSTM imported from models.py (single source of truth)
 
 
 # ===================================================================
@@ -178,59 +96,7 @@ class EmbeddingSequenceDataset(Dataset):
         return seq, label
 
 
-# ===================================================================
-# Helper: load the trained EfficientNet and strip classification head
-# ===================================================================
-
-def load_efficientnet_embedder(
-    model_path: str, device: torch.device
-) -> EfficientNetEmbedder:
-    """Load a trained EfficientNet-B0 checkpoint into the embedder.
-
-    The checkpoint is expected to have the full model state dict as
-    saved during EfficientNet training (same architecture as gradcam.py):
-        features.*           — convolutional backbone
-        classifier.0.weight  — Linear(1280, 256)
-        classifier.0.bias
-        classifier.1         — ReLU (no params)
-        classifier.2.weight  — Linear(256, 1)   <-- discarded
-        classifier.2.bias                        <-- discarded
-
-    We remap 'classifier.0.*' -> 'embed_fc.*' and ignore 'classifier.2.*'.
-    """
-    logger.info(f"Loading EfficientNet checkpoint from {model_path}")
-
-    state_dict = torch.load(model_path, map_location=device, weights_only=False)
-
-    # Handle case where checkpoint wraps state_dict in a dict
-    if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
-        state_dict = state_dict["model_state_dict"]
-    elif isinstance(state_dict, dict) and "state_dict" in state_dict:
-        state_dict = state_dict["state_dict"]
-
-    # Build key mapping from full-model keys to EfficientNetEmbedder keys
-    embedder = EfficientNetEmbedder()
-    mapped_dict: dict[str, torch.Tensor] = {}
-
-    for key, value in state_dict.items():
-        if key.startswith("features.") or key.startswith("avgpool."):
-            mapped_dict[key] = value
-        elif key.startswith("classifier.0."):
-            # classifier.0.weight -> embed_fc.weight
-            new_key = key.replace("classifier.0.", "embed_fc.")
-            mapped_dict[new_key] = value
-        # classifier.1 = ReLU (no state), classifier.2 = classification head (discard)
-
-    missing, unexpected = embedder.load_state_dict(mapped_dict, strict=False)
-    if missing:
-        logger.warning(f"Missing keys in embedder (expected if head-only): {missing}")
-    if unexpected:
-        logger.warning(f"Unexpected keys (ignored): {unexpected}")
-
-    embedder.to(device)
-    embedder.eval()
-    logger.info("EfficientNet embedder loaded and set to eval mode")
-    return embedder
+# load_efficientnet_embedder imported from models.py
 
 
 # ===================================================================

@@ -60,12 +60,16 @@ logging.basicConfig(
 logger = logging.getLogger("silentwitness.train")
 
 # ---------------------------------------------------------------------------
-# Constants
+# Shared model architecture (single source of truth)
 # ---------------------------------------------------------------------------
-EMBEDDING_DIM = 256
-IMAGE_SIZE = 224
-IMAGENET_MEAN = [0.485, 0.456, 0.406]
-IMAGENET_STD = [0.229, 0.224, 0.225]
+from models import (
+    EfficientNetDeepfake,
+    EMBEDDING_DIM,
+    EFFICIENTNET_INPUT_SIZE as IMAGE_SIZE,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+)
+
 SEED = 42
 
 
@@ -195,85 +199,7 @@ class DeepfakeFaceDataset(Dataset):
         return image, torch.tensor(label, dtype=torch.float32)
 
 
-# ===================================================================
-# Model
-# ===================================================================
-
-class EfficientNetDeepfake(nn.Module):
-    """EfficientNet-B0 for binary deepfake detection.
-
-    Architecture
-    ------------
-    The standard torchvision EfficientNet-B0 backbone extracts a 1280-dim
-    feature vector after global average pooling.  The custom classification
-    head maps this to a 256-dim embedding (used later by the temporal LSTM)
-    and then to a single logit for binary classification::
-
-        features (1280) -> Linear(1280, 256) -> ReLU -> Dropout -> Linear(256, 1)
-
-    The ``classifier`` attribute is stored as an ``nn.Sequential`` so that
-    the saved ``state_dict`` is directly loadable by the inference code in
-    ``gradcam.py`` and by the ONNX export pipeline, both of which expect
-    ``model.classifier = Sequential(Linear, ReLU, Linear)``.
-
-    Forward returns ``(logit, embedding)`` so both the binary prediction
-    and the 256-dim temporal feature are available during training.
-    """
-
-    def __init__(self, pretrained: bool = True) -> None:
-        super().__init__()
-
-        # Load the full EfficientNet-B0 from torchvision
-        if pretrained:
-            weights = models.EfficientNet_B0_Weights.IMAGENET1K_V1
-            base = models.efficientnet_b0(weights=weights)
-            logger.info("Loaded EfficientNet-B0 with ImageNet pretrained weights")
-        else:
-            base = models.efficientnet_b0(weights=None)
-            logger.info("Loaded EfficientNet-B0 without pretrained weights")
-
-        # Keep the convolutional backbone and pooling layer
-        self.features = base.features
-        self.avgpool = base.avgpool
-
-        # Custom classification head.
-        # We store it as model.classifier so the state_dict keys match
-        # the structure expected by gradcam.py and ONNX export:
-        #   classifier.0  -> Linear(1280, 256)
-        #   classifier.1  -> ReLU
-        #   classifier.2  -> Linear(256, 1)
-        # A Dropout layer is inserted at index 2 during training only;
-        # at export / inference time the dropout is a no-op (eval mode).
-        self.classifier = nn.Sequential(
-            nn.Linear(1280, EMBEDDING_DIM),       # 0
-            nn.ReLU(inplace=True),                # 1
-            nn.Dropout(p=0.3),                    # 2
-            nn.Linear(EMBEDDING_DIM, 1),          # 3
-        )
-
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass.
-
-        Args:
-            x: Input tensor of shape ``(B, 3, 224, 224)``.
-
-        Returns:
-            logit: Raw classification logit of shape ``(B, 1)``.
-            embedding: 256-dim embedding of shape ``(B, 256)``.
-        """
-        x = self.features(x)                     # (B, 1280, 7, 7)
-        x = self.avgpool(x)                      # (B, 1280, 1, 1)
-        x = torch.flatten(x, 1)                  # (B, 1280)
-
-        # Run through the head piece-by-piece so we can tap the embedding
-        embedding = self.classifier[1](           # ReLU
-            self.classifier[0](x)                 # Linear(1280, 256)
-        )                                         # (B, 256)
-        logit = self.classifier[3](               # Linear(256, 1)
-            self.classifier[2](embedding)         # Dropout
-        )                                         # (B, 1)
-
-        return logit, embedding
+# EfficientNetDeepfake is imported from models.py (single source of truth)
 
 
 # ===================================================================

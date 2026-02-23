@@ -8,7 +8,13 @@ organizing output into train/val/test splits at the VIDEO level to prevent
 data leakage. Supports all three compression levels (raw, c23, c40) and all
 four manipulation methods (Deepfakes, Face2Face, FaceSwap, NeuralTextures).
 
-Output structure:
+Supports both the legacy MediaPipe ``solutions`` API and the newer
+``mediapipe.tasks`` API (v0.10.21+). The appropriate backend is selected
+automatically at import time. When using the tasks API the required
+``face_landmarker.task`` model file is downloaded on first run.
+
+Output structure::
+
     output_dir/
         train/
             real/
@@ -23,7 +29,8 @@ Output structure:
             fake/ ...
         metadata.json
 
-Usage:
+Usage::
+
     python preprocess_dataset.py \\
         --dataset_root /path/to/FaceForensics++ \\
         --output_dir /path/to/output \\
@@ -38,12 +45,12 @@ import multiprocessing as mp
 import os
 import sys
 import time
+import urllib.request
 from functools import partial
 from pathlib import Path
 from typing import Optional
 
 import cv2
-import mediapipe
 import numpy as np
 
 try:
@@ -54,6 +61,34 @@ except ImportError:
         file=sys.stderr,
     )
     sys.exit(1)
+
+# ---------------------------------------------------------------------------
+# MediaPipe backend detection
+# ---------------------------------------------------------------------------
+
+_USE_TASKS_API: bool = False
+
+try:
+    # Prefer the newer tasks-based API (mediapipe >= 0.10.21)
+    import mediapipe as _mp
+    from mediapipe.tasks.python import vision as _mp_vision  # noqa: F401
+    from mediapipe.tasks.python.core.base_options import BaseOptions as _BaseOptions  # noqa: F401
+
+    _USE_TASKS_API = True
+except (ImportError, AttributeError):
+    pass
+
+if not _USE_TASKS_API:
+    try:
+        import mediapipe as _mp  # noqa: F811
+        # Verify legacy solutions API is accessible
+        _ = _mp.solutions.face_mesh
+    except (ImportError, AttributeError):
+        print(
+            "ERROR: mediapipe is required. Install it with: pip install mediapipe",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -78,6 +113,14 @@ TEST_RATIO = 0.15
 # JPEG save quality
 JPEG_QUALITY = 95
 
+# MediaPipe tasks API — model download
+_FACE_LANDMARKER_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+)
+_FACE_LANDMARKER_CACHE_DIR = Path.home() / ".cache" / "mediapipe"
+_FACE_LANDMARKER_PATH = _FACE_LANDMARKER_CACHE_DIR / "face_landmarker.task"
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -88,6 +131,123 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("preprocess_dataset")
+
+
+# ---------------------------------------------------------------------------
+# MediaPipe model management
+# ---------------------------------------------------------------------------
+
+
+def _ensure_face_landmarker_model() -> str:
+    """Download the face landmarker model if it is not already cached.
+
+    Returns:
+        Absolute path to the cached model file.
+    """
+    model_path = _FACE_LANDMARKER_PATH
+    if model_path.exists():
+        return str(model_path)
+
+    _FACE_LANDMARKER_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "Downloading face_landmarker.task to %s (one-time download)...",
+        model_path,
+    )
+    try:
+        urllib.request.urlretrieve(_FACE_LANDMARKER_URL, str(model_path))
+        logger.info("Download complete (%d bytes)", model_path.stat().st_size)
+    except Exception as exc:
+        # Clean up partial download
+        if model_path.exists():
+            model_path.unlink()
+        raise RuntimeError(
+            f"Failed to download face_landmarker.task: {exc}\n"
+            f"You can manually download from:\n  {_FACE_LANDMARKER_URL}\n"
+            f"and place it at:\n  {model_path}"
+        ) from exc
+
+    return str(model_path)
+
+
+# ---------------------------------------------------------------------------
+# Face detector abstraction — hides API differences
+# ---------------------------------------------------------------------------
+
+
+class _FaceDetectorLegacy:
+    """Face detector using the legacy ``mediapipe.solutions`` API."""
+
+    def __init__(self) -> None:
+        self._mesh = _mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=True,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+        )
+
+    def detect_landmarks(
+        self, rgb_image: np.ndarray
+    ) -> Optional[list[tuple[float, float]]]:
+        """Return normalized (x, y) landmark pairs or None if no face."""
+        results = self._mesh.process(rgb_image)
+        if not results.multi_face_landmarks:
+            return None
+        face = results.multi_face_landmarks[0]
+        return [(lm.x, lm.y) for lm in face.landmark]
+
+    def close(self) -> None:
+        self._mesh.close()
+
+
+class _FaceDetectorTasks:
+    """Face detector using the newer ``mediapipe.tasks`` API."""
+
+    def __init__(self, model_path: str) -> None:
+        from mediapipe.tasks.python import vision as mp_vision
+        from mediapipe.tasks.python.core.base_options import BaseOptions
+
+        options = mp_vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=mp_vision.RunningMode.IMAGE,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+        )
+        self._landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+
+    def detect_landmarks(
+        self, rgb_image: np.ndarray
+    ) -> Optional[list[tuple[float, float]]]:
+        """Return normalized (x, y) landmark pairs or None if no face."""
+        import mediapipe as mp_mod
+
+        mp_image = mp_mod.Image(
+            image_format=mp_mod.ImageFormat.SRGB, data=rgb_image
+        )
+        result = self._landmarker.detect(mp_image)
+        if not result.face_landmarks:
+            return None
+        face = result.face_landmarks[0]
+        return [(lm.x, lm.y) for lm in face]
+
+    def close(self) -> None:
+        self._landmarker.close()
+
+
+def _create_face_detector(model_path: Optional[str] = None) -> object:
+    """Factory that returns the appropriate face detector backend.
+
+    Args:
+        model_path: Path to face_landmarker.task (only used by tasks API).
+
+    Returns:
+        An object with ``detect_landmarks(rgb)`` and ``close()`` methods.
+    """
+    if _USE_TASKS_API:
+        if model_path is None:
+            model_path = _ensure_face_landmarker_model()
+        return _FaceDetectorTasks(model_path)
+    return _FaceDetectorLegacy()
 
 
 # ---------------------------------------------------------------------------
@@ -206,19 +366,21 @@ def extract_faces_from_video(
     output_base: Path,
     split: str,
     max_frames: int,
+    model_path: Optional[str] = None,
 ) -> dict:
     """Extract face crops from a single video and save as JPEGs.
 
     Frames are sampled at even intervals across the video duration.
-    For each sampled frame, MediaPipe Face Mesh detects the face,
-    applies 20% bounding-box padding, crops and resizes to 224x224,
-    and saves as a JPEG file.
+    For each sampled frame, MediaPipe detects the face, applies 20%
+    bounding-box padding, crops and resizes to 224x224, and saves as
+    a JPEG file.
 
     Args:
         video_info: Dict with keys: path, video_id, label, method.
         output_base: Root output directory.
         split: One of "train", "val", "test".
         max_frames: Maximum number of frames to extract per video.
+        model_path: Path to MediaPipe face landmarker model (tasks API only).
 
     Returns:
         Dict with processing results: video_id, split, label, method,
@@ -273,13 +435,8 @@ def extract_faces_from_video(
     # Remove duplicates that can occur with very short videos
     frame_indices = sorted(set(frame_indices))
 
-    # Initialize MediaPipe Face Mesh for this worker
-    face_mesh = mediapipe.solutions.face_mesh.FaceMesh(
-        static_image_mode=True,  # Each frame treated independently
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-    )
+    # Initialize face detector for this worker
+    detector = _create_face_detector(model_path)
 
     extracted = 0
     failed = 0
@@ -292,20 +449,19 @@ def extract_faces_from_video(
             failed += 1
             continue
 
-        # Detect face
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb)
+        h, w = frame.shape[:2]
 
-        if not results.multi_face_landmarks:
+        # Detect face — returns normalized (x, y) pairs
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        landmarks = detector.detect_landmarks(rgb)
+
+        if landmarks is None:
             failed += 1
             continue
 
-        face_landmarks = results.multi_face_landmarks[0]
-        h, w = frame.shape[:2]
-
-        # Compute bounding box from landmarks
-        xs = [lm.x * w for lm in face_landmarks.landmark]
-        ys = [lm.y * h for lm in face_landmarks.landmark]
+        # Compute bounding box from normalized landmarks
+        xs = [lx * w for lx, _ in landmarks]
+        ys = [ly * h for _, ly in landmarks]
         x_min, x_max = min(xs), max(xs)
         y_min, y_max = min(ys), max(ys)
 
@@ -343,7 +499,7 @@ def extract_faces_from_video(
         extracted += 1
 
     cap.release()
-    face_mesh.close()
+    detector.close()
 
     result["num_frames_extracted"] = extracted
     result["num_frames_failed"] = failed
@@ -359,6 +515,7 @@ def _process_video_worker(
     task: tuple[dict, str],
     output_base: Path,
     max_frames: int,
+    model_path: Optional[str] = None,
 ) -> dict:
     """Multiprocessing-compatible wrapper around extract_faces_from_video.
 
@@ -366,13 +523,16 @@ def _process_video_worker(
         task: Tuple of (video_info, split_name).
         output_base: Root output directory.
         max_frames: Maximum frames per video.
+        model_path: Path to MediaPipe face landmarker model (tasks API only).
 
     Returns:
         Processing result dict.
     """
     video_info, split = task
     try:
-        return extract_faces_from_video(video_info, output_base, split, max_frames)
+        return extract_faces_from_video(
+            video_info, output_base, split, max_frames, model_path
+        )
     except Exception as exc:
         return {
             "video_id": video_info.get("video_id", "unknown"),
@@ -500,8 +660,9 @@ def run_preprocessing(args: argparse.Namespace) -> None:
     1. Discover videos in the FaceForensics++ directory structure.
     2. Split real and fake video lists independently at the video level.
     3. Create output directory structure.
-    4. Process all videos with multiprocessing (face extraction + cropping).
-    5. Save metadata.json.
+    4. Ensure the MediaPipe model is available (tasks API only).
+    5. Process all videos with multiprocessing (face extraction + cropping).
+    6. Save metadata.json.
 
     Args:
         args: Parsed CLI arguments.
@@ -520,6 +681,7 @@ def run_preprocessing(args: argparse.Namespace) -> None:
     logger.info("Compression    : %s", compression)
     logger.info("Max frames/vid : %d", max_frames)
     logger.info("Workers        : %d", num_workers)
+    logger.info("MediaPipe API  : %s", "tasks" if _USE_TASKS_API else "legacy")
     logger.info("=" * 70)
 
     # Validate dataset root
@@ -576,7 +738,16 @@ def run_preprocessing(args: argparse.Namespace) -> None:
             (output_dir / split_name / class_name).mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # Step 4: Build task list and process with multiprocessing
+    # Step 4: Ensure MediaPipe model is cached (download once in main
+    #         process so workers don't race to download simultaneously)
+    # ------------------------------------------------------------------
+    model_path: Optional[str] = None
+    if _USE_TASKS_API:
+        model_path = _ensure_face_landmarker_model()
+        logger.info("MediaPipe model : %s", model_path)
+
+    # ------------------------------------------------------------------
+    # Step 5: Build task list and process with multiprocessing
     # ------------------------------------------------------------------
     tasks: list[tuple[dict, str]] = []
     for split_name in ["train", "val", "test"]:
@@ -592,6 +763,7 @@ def run_preprocessing(args: argparse.Namespace) -> None:
         _process_video_worker,
         output_base=output_dir,
         max_frames=max_frames,
+        model_path=model_path,
     )
 
     results: list[dict] = []
@@ -614,7 +786,7 @@ def run_preprocessing(args: argparse.Namespace) -> None:
     elapsed = time.time() - start_time
 
     # ------------------------------------------------------------------
-    # Step 5: Report results
+    # Step 6: Report results
     # ------------------------------------------------------------------
     total_extracted = sum(r["num_frames_extracted"] for r in results)
     total_failed = sum(r["num_frames_failed"] for r in results)
@@ -636,7 +808,7 @@ def run_preprocessing(args: argparse.Namespace) -> None:
             logger.warning("  ... and %d more errors", len(errors) - 20)
 
     # ------------------------------------------------------------------
-    # Step 6: Save metadata.json
+    # Step 7: Save metadata.json
     # ------------------------------------------------------------------
     metadata = build_metadata(real_splits, fake_splits, results, args)
     metadata_path = output_dir / "metadata.json"

@@ -17,10 +17,10 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from models import load_efficientnet_deepfake, IMAGENET_MEAN, IMAGENET_STD
+
 logger = logging.getLogger("silentwitness.gradcam")
 
-# Colormap for heatmap visualization
-# Blue (low attention) → Red (high attention)
 HEATMAP_ALPHA = 0.4  # Blend opacity
 
 
@@ -32,10 +32,14 @@ class GradCAM:
         self._target_layer = None
         self._activations: Optional[np.ndarray] = None
         self._gradients: Optional[np.ndarray] = None
-        self._hooks = []
+        self._hooks: list = []
 
     def load_model(self, model_path: str) -> bool:
         """Load a PyTorch EfficientNet model for Grad-CAM computation.
+
+        Uses the shared EfficientNetDeepfake from models.py to ensure
+        the architecture (including Dropout layer) matches the training
+        checkpoint exactly.
 
         Args:
             model_path: Path to the PyTorch .pt model file.
@@ -44,24 +48,11 @@ class GradCAM:
             True if model was loaded successfully.
         """
         try:
-            import torch
-            import torchvision.models as models
-
-            # Load the fine-tuned EfficientNet-B0
             if not os.path.exists(model_path):
                 logger.warning(f"PyTorch model not found at {model_path}")
                 return False
 
-            model = models.efficientnet_b0(weights=None)
-            # Replace classifier head to match training architecture
-            model.classifier = torch.nn.Sequential(
-                torch.nn.Linear(1280, 256),
-                torch.nn.ReLU(),
-                torch.nn.Linear(256, 1),
-            )
-            model.load_state_dict(torch.load(model_path, map_location="cpu"))
-            model.eval()
-
+            model = load_efficientnet_deepfake(model_path)
             self._model = model
             # Hook into the last convolutional layer: features[-1]
             self._target_layer = model.features[-1]
@@ -95,13 +86,12 @@ class GradCAM:
             ).float()
             input_tensor.requires_grad_(True)
 
-            # Forward pass
-            output = self._model(input_tensor)
+            # Forward pass — EfficientNetDeepfake returns (logit, embedding)
+            logit, _ = self._model(input_tensor)
 
             # Backward pass with respect to the "fake" class
-            # (lower score = more fake, so we use negative gradient)
             self._model.zero_grad()
-            output.backward()
+            logit.backward()
 
             if self._activations is None or self._gradients is None:
                 return None
@@ -123,15 +113,14 @@ class GradCAM:
             # Resize to face crop dimensions
             cam_resized = cv2.resize(cam, (224, 224))
 
-            # Apply colormap (JET: blue → red)
+            # Apply colormap (JET: blue -> red)
             heatmap = cv2.applyColorMap(
                 np.uint8(255 * cam_resized), cv2.COLORMAP_JET
             )
 
             # Blend with original face crop
-            # Denormalize the face crop for display
-            mean = np.array([0.485, 0.456, 0.406])
-            std = np.array([0.229, 0.224, 0.225])
+            mean = np.array(IMAGENET_MEAN)
+            std = np.array(IMAGENET_STD)
             face_display = ((face_crop * std + mean) * 255).clip(0, 255).astype(np.uint8)
             face_bgr = cv2.cvtColor(face_display, cv2.COLOR_RGB2BGR)
 

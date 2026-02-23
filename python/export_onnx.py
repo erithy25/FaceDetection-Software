@@ -23,17 +23,22 @@ from typing import Optional
 
 import numpy as np
 
+# Shared model architecture (single source of truth)
+from models import (
+    EfficientNetDeepfake,
+    EfficientNetExportWrapper,
+    TemporalLSTM,
+    load_efficientnet_deepfake,
+    load_temporal_lstm,
+    EMBEDDING_DIM,
+    LSTM_HIDDEN_DIM,
+    TEMPORAL_WINDOW,
+    EFFICIENTNET_INPUT_SIZE,
+    IMAGENET_MEAN,
+    IMAGENET_STD,
+)
+
 logger = logging.getLogger("silentwitness.export_onnx")
-
-# Architecture constants (must match classifier.py)
-EMBEDDING_DIM = 256
-TEMPORAL_WINDOW = 16
-EFFICIENTNET_INPUT_SIZE = 224
-LSTM_HIDDEN_DIM = 128
-
-# ImageNet normalization (must match detector.py)
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 # Validation tolerance
 ATOL_FP32 = 1e-5
@@ -41,135 +46,6 @@ ATOL_INT8 = 0.05
 
 # Calibration settings
 CALIBRATION_SAMPLE_COUNT = 500
-
-
-# ---------------------------------------------------------------------------
-# Model definitions
-# ---------------------------------------------------------------------------
-
-def _build_efficientnet() -> "torch.nn.Module":
-    """Build the EfficientNet-B0 architecture with custom head.
-
-    Architecture matches the training setup used throughout the project:
-    EfficientNet-B0 backbone with classifier head replaced by
-    Linear(1280, 256) -> ReLU -> Linear(256, 1).
-
-    Returns:
-        The bare model (weights not loaded).
-    """
-    import torch
-    import torchvision.models as models
-
-    model = models.efficientnet_b0(weights=None)
-    model.classifier = torch.nn.Sequential(
-        torch.nn.Linear(1280, EMBEDDING_DIM),
-        torch.nn.ReLU(),
-        torch.nn.Linear(EMBEDDING_DIM, 1),
-    )
-    return model
-
-
-class EfficientNetWrapper(object):
-    """Wrapper that exposes both the logit and the intermediate embedding.
-
-    The standard EfficientNet forward pass only returns the final logit.
-    ONNX inference in classifier.py expects two outputs:
-        outputs[0] — classification score  (batch, 1)
-        outputs[1] — 256-dim embedding     (batch, 256)
-
-    This wrapper hooks into the custom head to capture the intermediate
-    256-dim activation (output of the first Linear + ReLU) before the
-    final projection to a single logit.
-    """
-
-    def __init__(self, model: "torch.nn.Module") -> None:
-        import torch.nn as nn
-
-        self.backbone = model.features
-        self.avgpool = model.avgpool
-
-        # The classifier head is Sequential(Linear(1280,256), ReLU, Linear(256,1)).
-        # Split it into the embedding part and the projection part.
-        head = model.classifier
-        self.embedding_head = nn.Sequential(head[0], head[1])  # Linear + ReLU
-        self.projection = head[2]  # Linear(256, 1)
-
-    def to_module(self) -> "torch.nn.Module":
-        """Return a proper nn.Module for export."""
-        return _EfficientNetExportModule(
-            self.backbone, self.avgpool, self.embedding_head, self.projection
-        )
-
-
-class _EfficientNetExportModule(object):
-    """torch.nn.Module subclass suitable for torch.onnx.export.
-
-    We define this lazily so the import of torch only happens inside
-    the functions that need it.
-    """
-    pass  # Replaced at import time; see _make_export_module().
-
-
-def _make_efficientnet_export_module(model: "torch.nn.Module") -> "torch.nn.Module":
-    """Construct the ONNX-exportable wrapper module from a loaded model."""
-    import torch
-    import torch.nn as nn
-
-    head = model.classifier
-
-    class ExportModule(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.backbone = model.features
-            self.avgpool = model.avgpool
-            self.embedding_head = nn.Sequential(head[0], head[1])
-            self.projection = head[2]
-
-        def forward(self, x: torch.Tensor) -> tuple:
-            features = self.backbone(x)
-            pooled = self.avgpool(features)
-            flat = torch.flatten(pooled, 1)
-            embedding = self.embedding_head(flat)
-            logit = self.projection(embedding)
-            return logit, embedding
-
-    export_module = ExportModule()
-    export_module.eval()
-    return export_module
-
-
-def _build_lstm() -> "torch.nn.Module":
-    """Build the temporal LSTM model.
-
-    Architecture: single-layer LSTM with hidden_dim=128, followed by
-    a fully-connected layer mapping to a single temporal score.
-
-    Input:  (batch, 16, 256)  — sequence of frame embeddings
-    Output: (batch, 1)        — temporal deepfake score
-    """
-    import torch
-    import torch.nn as nn
-
-    class TemporalLSTM(nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.lstm = nn.LSTM(
-                input_size=EMBEDDING_DIM,
-                hidden_size=LSTM_HIDDEN_DIM,
-                num_layers=1,
-                batch_first=True,
-            )
-            self.fc = nn.Linear(LSTM_HIDDEN_DIM, 1)
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            # x: (batch, seq_len, embedding_dim)
-            lstm_out, _ = self.lstm(x)
-            # Use the last time-step output
-            last_hidden = lstm_out[:, -1, :]
-            score = self.fc(last_hidden)
-            return score
-
-    return TemporalLSTM()
 
 
 # ---------------------------------------------------------------------------
@@ -192,12 +68,8 @@ def export_efficientnet(
     import torch
 
     logger.info("Loading EfficientNet-B0 from %s", model_path)
-    base_model = _build_efficientnet()
-    state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-    base_model.load_state_dict(state_dict)
-    base_model.eval()
-
-    export_model = _make_efficientnet_export_module(base_model)
+    base_model = load_efficientnet_deepfake(model_path)
+    export_model = EfficientNetExportWrapper(base_model)
 
     dummy_input = torch.randn(1, 3, EFFICIENTNET_INPUT_SIZE, EFFICIENTNET_INPUT_SIZE)
 
@@ -238,10 +110,7 @@ def export_lstm(
     import torch
 
     logger.info("Loading temporal LSTM from %s", model_path)
-    model = _build_lstm()
-    state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-    model.load_state_dict(state_dict)
-    model.eval()
+    model = load_temporal_lstm(model_path)
 
     dummy_input = torch.randn(1, TEMPORAL_WINDOW, EMBEDDING_DIM)
 
