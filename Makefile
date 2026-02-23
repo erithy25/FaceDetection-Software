@@ -2,6 +2,7 @@
 #
 # Usage:
 #   make setup          Install all dependencies (Node + Python)
+#   make demo           Quick-start demo (synthetic data, ~1 min)
 #   make preprocess     Extract faces from FaceForensics++ dataset
 #   make train          Train EfficientNet-B0 + LSTM (full pipeline)
 #   make export         Export to ONNX + INT8 quantization
@@ -103,6 +104,60 @@ pipeline: preprocess train export
 	@echo "  Models ready in: $(MODEL_DIR)/"
 	@echo "═══════════════════════════════════════════════"
 
+# ─── Demo (Quick-Start) ────────────────────────────────────────────
+#
+# Generates synthetic face-crop images and runs the full train+export
+# pipeline with minimal epochs.  No dataset download needed.
+# Total runtime: ~1 minute on a modern machine.
+
+.PHONY: demo demo-data
+
+demo-data:
+	@echo "→ Generating synthetic demo dataset..."
+	$(PYTHON) python/generate_demo_data.py \
+		--output_dir "$(DATA_DIR)"
+	@echo "✓ Demo data generated in $(DATA_DIR)"
+
+demo: demo-data
+	@echo ""
+	@echo "→ Training EfficientNet-B0 (demo: 2 epochs)..."
+	$(PYTHON) python/train_efficientnet.py \
+		--data_dir "$(DATA_DIR)" \
+		--output_dir "$(MODEL_DIR)" \
+		--epochs 2 \
+		--batch_size 16 \
+		--num_workers 0
+	@echo "✓ EfficientNet demo training complete"
+	@echo ""
+	@echo "→ Training Temporal LSTM (demo: 3 epochs)..."
+	$(PYTHON) python/train_lstm.py \
+		--data_dir "$(DATA_DIR)" \
+		--efficientnet_model "$(MODEL_DIR)/best_efficientnet_b0_deepfake.pt" \
+		--output_dir "$(MODEL_DIR)" \
+		--epochs 3 \
+		--batch_size 8 \
+		--num_workers 0
+	@echo "✓ LSTM demo training complete"
+	@echo ""
+	@echo "→ Exporting models to ONNX..."
+	$(PYTHON) python/export_onnx.py \
+		--efficientnet_model "$(MODEL_DIR)/best_efficientnet_b0_deepfake.pt" \
+		--lstm_model "$(MODEL_DIR)/temporal_lstm_best.pt" \
+		--calibration_dir "$(DATA_DIR)/train/real" \
+		--output_dir "$(MODEL_DIR)" \
+		--skip_quantization \
+		--skip_validation
+	@echo "✓ ONNX export complete"
+	@echo ""
+	@echo "═══════════════════════════════════════════════════════"
+	@echo "  SilentWitness Demo Pipeline — COMPLETE"
+	@echo "  Models ready in: $(MODEL_DIR)/"
+	@echo ""
+	@echo "  Next steps:"
+	@echo "    make run-backend    Start the detection backend"
+	@echo "    make dev            Start full Tauri app"
+	@echo "═══════════════════════════════════════════════════════"
+
 # ─── Evaluation ─────────────────────────────────────────────────────
 
 .PHONY: evaluate
@@ -158,7 +213,11 @@ help:
 	@echo "    make setup-python     Install Python deps only"
 	@echo "    make setup-node       Install Node deps only"
 	@echo ""
-	@echo "  ML Pipeline:"
+	@echo "  Quick Start:"
+	@echo "    make demo             Full pipeline with synthetic data (~1 min)"
+	@echo "    make demo-data        Generate synthetic data only"
+	@echo ""
+	@echo "  ML Pipeline (requires FaceForensics++ dataset):"
 	@echo "    make preprocess       Extract faces from FF++ dataset"
 	@echo "    make train            Train EfficientNet + LSTM"
 	@echo "    make export           Export to ONNX + INT8"
