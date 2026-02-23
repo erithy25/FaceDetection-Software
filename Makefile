@@ -34,12 +34,12 @@ PYTHON := $(shell \
 
 # ─── Setup ──────────────────────────────────────────────────────────
 
-.PHONY: setup setup-python setup-node
+.PHONY: setup setup-python setup-node setup-mediapipe setup-sidecar
 
 setup: setup-python setup-node
 	@echo "✓ All dependencies installed"
 
-setup-python:
+setup-python: setup-mediapipe
 	@echo "→ Creating Python virtual environment..."
 	$(PYTHON) -m venv .venv || true
 	.venv/bin/pip install --upgrade pip
@@ -50,6 +50,30 @@ setup-node:
 	@echo "→ Installing Node dependencies..."
 	npm install
 	@echo "✓ Node dependencies installed"
+
+# Download the MediaPipe face landmarker model (required by detector.py)
+MEDIAPIPE_MODEL := python/models/face_landmarker.task
+MEDIAPIPE_URL   := https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task
+
+setup-mediapipe: $(MEDIAPIPE_MODEL)
+
+$(MEDIAPIPE_MODEL):
+	@echo "→ Downloading MediaPipe face landmarker model..."
+	@mkdir -p python/models
+	curl -fSL -o $@ "$(MEDIAPIPE_URL)"
+	@echo "✓ MediaPipe model downloaded to $@"
+
+# Create the platform-specific sidecar symlink expected by Tauri
+TARGET_TRIPLE := $(shell rustc -vV 2>/dev/null | sed -n 's/host: //p')
+
+setup-sidecar:
+ifneq ($(TARGET_TRIPLE),)
+	@ln -sf silentwitness-backend.sh src-tauri/sidecar/silentwitness-backend-$(TARGET_TRIPLE)
+	@chmod +x src-tauri/sidecar/silentwitness-backend.sh
+	@echo "✓ Sidecar symlink: silentwitness-backend-$(TARGET_TRIPLE)"
+else
+	@echo "⚠ rustc not found — skipping sidecar symlink"
+endif
 
 # ─── ML Pipeline ────────────────────────────────────────────────────
 
@@ -175,11 +199,11 @@ evaluate:
 
 .PHONY: run-backend dev build
 
-run-backend:
+run-backend: $(MEDIAPIPE_MODEL)
 	@echo "→ Starting Python backend (standalone dev mode)..."
 	$(PYTHON) python/main.py --debug
 
-dev:
+dev: setup-sidecar
 	@echo "→ Starting Tauri dev environment..."
 	npm run tauri dev
 

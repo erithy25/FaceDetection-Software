@@ -1,16 +1,23 @@
 """
-Face Detection & Preprocessing Module — MediaPipe Face Mesh.
+Face Detection & Preprocessing Module — MediaPipe Face Landmarker.
 
-Extracts faces from video frames using MediaPipe's 468-landmark
-face mesh. Handles face cropping with padding, normalization to
-EfficientNet input format, and feature extraction (blink detection,
-head pose estimation).
+Extracts faces from video frames using MediaPipe's 478-landmark
+face landmarker (Tasks API).  Handles face cropping with padding,
+normalization to EfficientNet input format, and feature extraction
+(blink detection, head pose estimation).
 """
 
+import os
 from typing import Optional
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks.python import BaseOptions
+from mediapipe.tasks.python.vision import (
+    FaceLandmarker,
+    FaceLandmarkerOptions,
+    RunningMode,
+)
 import numpy as np
 
 # EfficientNet-B0 input dimensions
@@ -33,18 +40,33 @@ RIGHT_EYE_BOTTOM = 374
 # Blink detection threshold (eye aspect ratio)
 BLINK_EAR_THRESHOLD = 0.21
 
+# Default path for the mediapipe face landmarker model
+_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+_DEFAULT_MODEL_PATH = os.path.join(_MODEL_DIR, "face_landmarker.task")
+
 
 class FaceDetector:
     """MediaPipe-based face detection with landmark extraction."""
 
-    def __init__(self) -> None:
-        self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
+    def __init__(self, model_path: Optional[str] = None) -> None:
+        model_path = model_path or _DEFAULT_MODEL_PATH
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(
+                f"MediaPipe face landmarker model not found at {model_path}. "
+                "Run 'make setup-mediapipe' to download it."
+            )
+
+        options = FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=model_path),
+            running_mode=RunningMode.IMAGE,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
             min_tracking_confidence=0.5,
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=False,
         )
+        self._landmarker = FaceLandmarker.create_from_options(options)
         self._no_face_count = 0
         self._blink_state = False  # True = eyes closed
         self._blink_frames_since_last = 0
@@ -61,27 +83,28 @@ class FaceDetector:
         Returns:
             Tuple of (face_crop, landmarks, features) or None if no face found.
             - face_crop: normalized 224x224 RGB array (float32, ImageNet-normalized)
-            - landmarks: array of 468 (x, y, z) landmark coordinates
+            - landmarks: array of 478 (x, y, z) landmark coordinates
             - features: dict with blink rate, head pose, etc.
         """
         # Convert BGR to RGB for MediaPipe
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = self._face_mesh.process(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        results = self._landmarker.detect(mp_image)
 
-        if not results.multi_face_landmarks:
+        if not results.face_landmarks:
             self._no_face_count += 1
             if self._no_face_count > NO_FACE_THRESHOLD:
                 return None  # Enter standby mode
             return None
 
         self._no_face_count = 0
-        face_landmarks = results.multi_face_landmarks[0]
+        face_lms = results.face_landmarks[0]
 
         h, w = frame.shape[:2]
 
         # Extract landmark coordinates as numpy array
         landmarks = np.array(
-            [(lm.x * w, lm.y * h, lm.z * w) for lm in face_landmarks.landmark],
+            [(lm.x * w, lm.y * h, lm.z * w) for lm in face_lms],
             dtype=np.float32,
         )
 
