@@ -12,9 +12,16 @@ import { useDetectionState } from "./hooks/useDetectionState";
 
 function App() {
   const [showAnalysis, setShowAnalysis] = useState(false);
+  const {
+    mode,
+    gradcamEnabled,
+    scoreHistory,
+    switchMode,
+    toggleGradcam,
+    addScoreEntry,
+  } = useDetectionState();
   const { frame, score, status, temporalScore, frameScore, fps, features, heatmap } =
-    useWebSocket("ws://localhost:9734");
-  const { mode, gradcamEnabled, switchMode, toggleGradcam } = useDetectionState();
+    useWebSocket("ws://localhost:9734", addScoreEntry);
 
   return (
     <div className="flex h-screen w-screen flex-col bg-background font-sans text-text-primary">
@@ -34,7 +41,7 @@ function App() {
           >
             {showAnalysis ? "Dashboard" : "Analysis"}
           </button>
-          <DemoControls mode={mode} onSwitchMode={switchMode} />
+          <DemoControls mode={mode} onSwitchMode={switchMode} currentStatus={status} />
         </div>
       </header>
 
@@ -77,7 +84,7 @@ function App() {
                 <h3 className="mb-2 text-xs font-medium text-text-secondary uppercase tracking-wider">
                   Score History (60s)
                 </h3>
-                <ScoreGraph />
+                <ScoreGraph scoreHistory={scoreHistory} />
               </div>
 
               <div>

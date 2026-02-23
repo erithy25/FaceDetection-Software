@@ -42,8 +42,12 @@ const DEFAULT_FEATURES: Features = { blink: 0, texture: 0, temporal: 0 };
 /**
  * WebSocket hook for receiving detection results and video frames
  * from the Python backend. Handles reconnection with exponential backoff.
+ * Optionally calls onScore callback for score history tracking.
  */
-export function useWebSocket(url: string): WebSocketState {
+export function useWebSocket(
+  url: string,
+  onScore?: (score: number) => void,
+): WebSocketState {
   const [state, setState] = useState<WebSocketState>({
     frame: null,
     score: 0,
@@ -59,6 +63,8 @@ export function useWebSocket(url: string): WebSocketState {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeout = useRef<ReturnType<typeof setTimeout>>();
   const reconnectDelay = useRef(1000);
+  const onScoreRef = useRef(onScore);
+  onScoreRef.current = onScore;
 
   const connect = useCallback(() => {
     try {
@@ -85,6 +91,7 @@ export function useWebSocket(url: string): WebSocketState {
               heatmap: msg.heatmap ?? null,
               connected: true,
             });
+            onScoreRef.current?.(msg.score);
           }
         } catch {
           // Ignore malformed messages

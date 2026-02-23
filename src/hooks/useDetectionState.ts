@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from "react";
+import { useState, useCallback, useRef } from "react";
 
 interface ScoreHistoryEntry {
   time: string;
@@ -11,37 +11,50 @@ interface DetectionState {
   scoreHistory: ScoreHistoryEntry[];
   switchMode: (mode: "live" | "deepfake") => void;
   toggleGradcam: (enabled: boolean) => void;
+  addScoreEntry: (score: number) => void;
 }
 
 const MAX_HISTORY_POINTS = 120; // 60 seconds at ~2 points/sec
+const WS_URL = "ws://localhost:9734";
 
 /**
  * State management hook for detection settings and score history.
- * Sends control commands to the Python backend via WebSocket.
+ * Sends control commands to the Python backend via a lazily-opened
+ * WebSocket (avoids opening a duplicate persistent connection).
  */
 export function useDetectionState(): DetectionState {
   const [mode, setMode] = useState<"live" | "deepfake">("live");
   const [gradcamEnabled, setGradcamEnabled] = useState(false);
   const [scoreHistory, setScoreHistory] = useState<ScoreHistoryEntry[]>([]);
-  const wsRef = useRef<WebSocket | null>(null);
+  const commandWsRef = useRef<WebSocket | null>(null);
 
-  useEffect(() => {
+  const getCommandWs = useCallback((): WebSocket | null => {
+    if (
+      commandWsRef.current &&
+      commandWsRef.current.readyState === WebSocket.OPEN
+    ) {
+      return commandWsRef.current;
+    }
     try {
-      const ws = new WebSocket("ws://localhost:9734");
-      wsRef.current = ws;
-      return () => ws.close();
+      const ws = new WebSocket(WS_URL);
+      commandWsRef.current = ws;
+      ws.onclose = () => {
+        commandWsRef.current = null;
+      };
+      return ws;
     } catch {
-      // Connection handled by useWebSocket hook
+      return null;
     }
   }, []);
 
   const sendCommand = useCallback(
     (command: string, params: Record<string, unknown> = {}) => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ command, ...params }));
+      const ws = getCommandWs();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ command, ...params }));
       }
     },
-    [],
+    [getCommandWs],
   );
 
   const switchMode = useCallback(
@@ -75,5 +88,6 @@ export function useDetectionState(): DetectionState {
     scoreHistory,
     switchMode,
     toggleGradcam,
+    addScoreEntry,
   };
 }

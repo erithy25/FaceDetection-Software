@@ -3,11 +3,19 @@ Deepfake Classifier — EfficientNet-B0 (frame-level) + LSTM (temporal).
 
 Handles ONNX-based inference for both the frame-level EfficientNet
 classifier and the temporal LSTM layer. Manages the embedding buffer
-for temporal analysis and provides Grad-CAM heatmap generation.
+for temporal analysis.
+
+Model outputs:
+  - EfficientNet ONNX: output[0] = logit (1,1), output[1] = embedding (1,256)
+  - LSTM ONNX: output[0] = logit (1,1)
+
+Both logits are passed through sigmoid to get [0,1] scores.
+Score meaning: 1.0 = definitely real, 0.0 = definitely fake.
 """
 
 import os
 import logging
+import time
 from collections import deque
 from typing import Optional
 
@@ -18,6 +26,7 @@ logger = logging.getLogger("silentwitness.classifier")
 # Model file paths
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
 EFFICIENTNET_MODEL = os.path.join(MODEL_DIR, "efficientnet_b0_deepfake.onnx")
+EFFICIENTNET_MODEL_INT8 = os.path.join(MODEL_DIR, "efficientnet_b0_deepfake_int8.onnx")
 LSTM_MODEL = os.path.join(MODEL_DIR, "temporal_lstm.onnx")
 
 # Architecture constants
@@ -43,56 +52,85 @@ class DeepfakeClassifier:
         self.last_embedding: Optional[np.ndarray] = None
         self._last_temporal_score: float = 0.5
 
-        # LSTM hidden state (carried between windows)
-        self._lstm_hidden: Optional[np.ndarray] = None
-        self._lstm_cell: Optional[np.ndarray] = None
+        # Performance tracking
+        self._inference_times: deque[float] = deque(maxlen=100)
 
     def load_models(self) -> None:
         """Load ONNX models for inference.
 
-        Falls back to dummy inference if models are not found (development mode).
+        Prefers INT8 quantized model if available, falls back to FP32,
+        then falls back to dummy inference if no models are found.
         """
         try:
             import onnxruntime as ort
 
-            if os.path.exists(EFFICIENTNET_MODEL):
+            sess_options = ort.SessionOptions()
+            sess_options.graph_optimization_level = (
+                ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            )
+            # Use all available CPU threads
+            sess_options.intra_op_num_threads = 0
+
+            # Load EfficientNet (prefer INT8)
+            eff_path = None
+            if os.path.exists(EFFICIENTNET_MODEL_INT8):
+                eff_path = EFFICIENTNET_MODEL_INT8
+                logger.info("Using INT8 quantized EfficientNet model")
+            elif os.path.exists(EFFICIENTNET_MODEL):
+                eff_path = EFFICIENTNET_MODEL
+                logger.info("Using FP32 EfficientNet model")
+
+            if eff_path:
                 self._efficientnet_session = ort.InferenceSession(
-                    EFFICIENTNET_MODEL,
+                    eff_path,
+                    sess_options=sess_options,
                     providers=["CPUExecutionProvider"],
                 )
-                logger.info("EfficientNet model loaded")
+                # Validate model outputs
+                outputs = self._efficientnet_session.get_outputs()
+                logger.info(
+                    f"EfficientNet loaded: {len(outputs)} outputs "
+                    f"({', '.join(o.name for o in outputs)})"
+                )
             else:
                 logger.warning(
-                    f"EfficientNet model not found at {EFFICIENTNET_MODEL}, "
-                    "using dummy inference"
+                    f"No EfficientNet model found in {MODEL_DIR}, "
+                    "using dummy inference (random scores)"
                 )
 
+            # Load LSTM
             if os.path.exists(LSTM_MODEL):
                 self._lstm_session = ort.InferenceSession(
                     LSTM_MODEL,
+                    sess_options=sess_options,
                     providers=["CPUExecutionProvider"],
                 )
                 logger.info("LSTM model loaded")
             else:
                 logger.warning(
                     f"LSTM model not found at {LSTM_MODEL}, "
-                    "using dummy inference"
+                    "using dummy temporal inference"
                 )
 
         except ImportError:
-            logger.warning("ONNX Runtime not installed, using dummy inference")
+            logger.warning(
+                "ONNX Runtime not installed. Install with: "
+                "pip install onnxruntime. Using dummy inference."
+            )
 
     def classify_frame(self, face_crop: np.ndarray) -> tuple[float, np.ndarray]:
         """Classify a single face crop as real or fake.
 
         Args:
-            face_crop: Normalized 224x224 RGB face image (float32).
+            face_crop: Normalized 224x224 RGB face image (float32, ImageNet-normalized).
 
         Returns:
             Tuple of (frame_score, embedding).
-            - frame_score: probability of being real [0.0–1.0]
+            - frame_score: probability of being real [0.0-1.0]
             - embedding: 256-dim feature vector for temporal analysis
         """
+        t0 = time.perf_counter()
+
         if self._efficientnet_session is not None:
             # Prepare input: (1, 3, 224, 224) — NCHW format
             input_tensor = np.transpose(face_crop, (2, 0, 1))[np.newaxis].astype(
@@ -102,7 +140,7 @@ class DeepfakeClassifier:
             input_name = self._efficientnet_session.get_inputs()[0].name
             outputs = self._efficientnet_session.run(None, {input_name: input_tensor})
 
-            # outputs[0] = classification score, outputs[1] = embedding
+            # outputs[0] = classification logit (1, 1), outputs[1] = embedding (1, 256)
             frame_score = float(_sigmoid(outputs[0][0, 0]))
             embedding = outputs[1][0].astype(np.float32)
         else:
@@ -110,6 +148,11 @@ class DeepfakeClassifier:
             frame_score = 0.5 + np.random.normal(0, 0.05)
             frame_score = float(np.clip(frame_score, 0.0, 1.0))
             embedding = np.random.randn(EMBEDDING_DIM).astype(np.float32)
+            # Simulate inference latency
+            time.sleep(0.005)
+
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        self._inference_times.append(elapsed_ms)
 
         self.last_frame_score = frame_score
         self.last_embedding = embedding
@@ -128,7 +171,7 @@ class DeepfakeClassifier:
             embedding: Current frame embedding (may be None if skipped).
 
         Returns:
-            Temporal confidence score [0.0–1.0].
+            Temporal confidence score [0.0-1.0].
         """
         # Only run LSTM every TEMPORAL_STRIDE frames and when buffer is full
         if (
@@ -154,32 +197,21 @@ class DeepfakeClassifier:
         self._last_temporal_score = temporal_score
         return temporal_score
 
-    def generate_gradcam(self, face_crop: np.ndarray) -> Optional[np.ndarray]:
-        """Generate a Grad-CAM heatmap for the current face crop.
-
-        This is only available when using PyTorch models (not ONNX).
-        For ONNX inference, returns None. The Grad-CAM module handles
-        this separately using a PyTorch model copy.
-
-        Args:
-            face_crop: Normalized 224x224 RGB face image.
-
-        Returns:
-            BGR heatmap overlay image or None.
-        """
-        # Grad-CAM requires PyTorch model with gradient computation.
-        # Delegated to gradcam.py module when available.
-        return None
+    @property
+    def avg_inference_ms(self) -> float:
+        """Average inference time in milliseconds (last 100 frames)."""
+        if not self._inference_times:
+            return 0.0
+        return sum(self._inference_times) / len(self._inference_times)
 
     def reset(self) -> None:
-        """Reset classifier state (embedding buffer, counters, hidden states)."""
+        """Reset classifier state (embedding buffer, counters)."""
         self._embedding_buffer.clear()
         self._frame_counter = 0
         self.last_frame_score = 0.5
         self.last_embedding = None
         self._last_temporal_score = 0.5
-        self._lstm_hidden = None
-        self._lstm_cell = None
+        self._inference_times.clear()
 
 
 def _sigmoid(x: float | np.ndarray) -> float | np.ndarray:

@@ -6,15 +6,21 @@ import {
   ReferenceArea,
   ResponsiveContainer,
 } from "recharts";
-import { useDetectionState } from "../hooks/useDetectionState";
+
+interface ScoreHistoryEntry {
+  time: string;
+  score: number;
+}
+
+interface ScoreGraphProps {
+  scoreHistory: ScoreHistoryEntry[];
+}
 
 /**
  * Temporal line chart showing score history over the last 60 seconds.
- * Background zones colored green (>0.85), yellow (0.60–0.85), red (<0.60).
+ * Background zones colored green (>0.85), yellow (0.60-0.85), red (<0.60).
  */
-export default function ScoreGraph() {
-  const { scoreHistory } = useDetectionState();
-
+export default function ScoreGraph({ scoreHistory }: ScoreGraphProps) {
   return (
     <div className="rounded-card border border-border bg-background p-3">
       <ResponsiveContainer width="100%" height={160}>
