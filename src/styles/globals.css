@@ -1,0 +1,76 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap");
+
+@layer base {
+  html {
+    font-family: "Inter", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply m-0 overflow-hidden bg-background text-text-primary;
+  }
+}
+
+@layer components {
+  /* Confidence Ring Animation */
+  .confidence-ring {
+    @apply relative flex items-center justify-center;
+  }
+
+  .confidence-ring-circle {
+    transition: stroke-dashoffset 300ms ease-out, stroke 300ms ease-out;
+  }
+
+  /* Score counting animation */
+  .score-value {
+    font-variant-numeric: tabular-nums;
+    transition: color 300ms ease-out;
+  }
+
+  /* Status badge transitions */
+  .status-badge {
+    transition: background-color 300ms ease-out, color 300ms ease-out;
+  }
+
+  /* Video feed canvas */
+  .video-canvas {
+    @apply h-full w-full object-contain;
+    image-rendering: -webkit-optimize-contrast;
+  }
+
+  /* Heatmap overlay blend */
+  .heatmap-overlay {
+    mix-blend-mode: screen;
+    opacity: 0.4;
+    pointer-events: none;
+  }
+
+  /* Card styling */
+  .card {
+    @apply rounded-card border border-border bg-surface p-4;
+  }
+}
+
+@layer utilities {
+  /* Scrollbar styling for dark mode */
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-border;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    @apply bg-text-secondary;
+  }
+}
