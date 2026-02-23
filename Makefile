@@ -126,7 +126,8 @@ demo: demo-data
 		--output_dir "$(MODEL_DIR)" \
 		--epochs 2 \
 		--batch_size 16 \
-		--num_workers 0
+		--num_workers 0 \
+		--no_pretrained
 	@echo "✓ EfficientNet demo training complete"
 	@echo ""
 	@echo "→ Training Temporal LSTM (demo: 3 epochs)..."

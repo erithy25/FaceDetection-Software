@@ -463,7 +463,7 @@ def train(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Model
     # ------------------------------------------------------------------
-    model = EfficientNetDeepfake(pretrained=True).to(device)
+    model = EfficientNetDeepfake(pretrained=not args.no_pretrained).to(device)
     logger.info(
         "Model parameters: %.2fM",
         sum(p.numel() for p in model.parameters()) / 1e6,
@@ -730,6 +730,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=4,
         help="Number of data-loading worker processes.",
+    )
+    parser.add_argument(
+        "--no_pretrained",
+        action="store_true",
+        default=False,
+        help="Skip downloading ImageNet weights (useful for demo/offline).",
     )
 
     return parser.parse_args()
